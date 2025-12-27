@@ -22,9 +22,12 @@ COPY pyproject.toml README.md /app/
 RUN poetry install --no-root
 
 COPY src/ /app/src/
+COPY scripts/docker-entrypoint.sh /app/scripts/docker-entrypoint.sh
+
+RUN chmod +x /app/scripts/docker-entrypoint.sh
 
 EXPOSE 8000
 
-CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["/app/scripts/docker-entrypoint.sh"]
 
 

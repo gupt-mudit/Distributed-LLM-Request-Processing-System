@@ -33,19 +33,15 @@ worker crashes mid-flight.
    - Copy `config/env.example` to `.env` (or edit the example file) if you need to
      override defaults such as database credentials or embedding model name.
 
-3. **Boot the stack**
+3. **Boot the stack (migrations run automatically)**
    ```bash
    docker compose up --build
    ```
    This starts PostgreSQL (with `pgvector`), Redis, the FastAPI app, Celery worker,
-   and Celery beat scheduler.
+   and Celery beat scheduler. The API container’s entrypoint applies Alembic
+   migrations before Uvicorn launches, so the schema is always up to date.
 
-4. **Run database migrations**
-   ```bash
-   docker compose exec api alembic upgrade head
-   ```
-
-5. **Verify**
+4. **Verify**
    - Health check: `curl http://localhost:8000/health`
    - Submit prompt:
      ```bash
