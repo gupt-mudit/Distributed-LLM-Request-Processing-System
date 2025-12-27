@@ -1,0 +1,87 @@
+version: "3.9"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file:
+      - config/env.example
+    volumes:
+      - ./:/app
+    depends_on:
+      - postgres
+      - redis
+      - worker
+    ports:
+      - "8000:8000"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    command: >
+      celery -A src.worker.app worker
+      --loglevel=info
+      --concurrency=4
+      -Q prompt_high,prompt_normal,prompt_low
+    env_file:
+      - config/env.example
+    volumes:
+      - ./:/app
+    depends_on:
+      - postgres
+      - redis
+
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    command: celery -A src.worker.app beat --loglevel=info
+    env_file:
+      - config/env.example
+    volumes:
+      - ./:/app
+    depends_on:
+      - redis
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-prompt_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-prompt_password}
+      POSTGRES_DB: ${POSTGRES_DB:-prompt_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/postgres-init:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:10.4.5
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+
+

@@ -1,0 +1,27 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    POETRY_VIRTUALENVS_CREATE=false \
+    POETRY_VERSION=1.8.3
+
+ENV PATH="/root/.local/bin:${PATH}"
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential curl && \
+    curl -sSL https://install.python-poetry.org | python3 - && \
+    apt-get purge -y curl && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml README.md /app/
+
+RUN poetry install --no-root
+
+COPY src/ /app/src/
+
+CMD ["celery", "-A", "src.worker.app", "worker", "--loglevel=info"]
+
+
