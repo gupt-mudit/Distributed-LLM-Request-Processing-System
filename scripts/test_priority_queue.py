@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import os
 import sys
+import threading
 from dataclasses import dataclass
 from typing import List
 
@@ -52,17 +53,61 @@ def enqueue_task(priority: str, index: int) -> TaskHandle:
     return TaskHandle(priority, prompt_id, queue, time.perf_counter(), async_result=result)
 
 
+def enqueue_task_threaded(
+    priority: str,
+    index: int,
+    handles: List[TaskHandle],
+    barrier: threading.Barrier,
+    lock: threading.Lock,
+) -> None:
+    """Enqueue a task in a thread, waiting for barrier to ensure simultaneous enqueuing."""
+    barrier.wait()  # Wait for all threads to be ready
+    handle = enqueue_task(priority, index)
+    with lock:
+        handles.append(handle)
+
+
 @click.command()
 @click.option("--low-count", default=6, show_default=True)
 @click.option("--timeout", default=60, show_default=True, help="Seconds to wait for each task to finish.")
 def main(low_count: int, timeout: float) -> None:
-    """Queue a batch of low-priority tasks followed by a high-priority task and show completion order."""
+    """Queue low-priority and high-priority tasks simultaneously using parallel threads.
+    
+    All tasks are enqueued at the same time to test if workers respect queue priority
+    (checking prompt_high queue first, then prompt_normal, then prompt_low).
+    """
     handles: List[TaskHandle] = []
+    lock = threading.Lock()
+    
+    # Create a barrier to synchronize all threads
+    # Total threads = low_count + 1 (for high-priority task)
+    barrier = threading.Barrier(low_count + 1)
+    threads: List[threading.Thread] = []
+    
+    click.echo(f"Enqueuing {low_count} low-priority + 1 high-priority task simultaneously...")
+    
+    # Start threads for low-priority tasks
     for i in range(low_count):
-        handles.append(enqueue_task("low", i))
-
-    time.sleep(0.5)
-    handles.append(enqueue_task("high", 0))
+        thread = threading.Thread(
+            target=enqueue_task_threaded,
+            args=("low", i, handles, barrier, lock),
+        )
+        thread.start()
+        threads.append(thread)
+    
+    # Start thread for high-priority task
+    high_thread = threading.Thread(
+        target=enqueue_task_threaded,
+        args=("high", 0, handles, barrier, lock),
+    )
+    high_thread.start()
+    threads.append(high_thread)
+    
+    # Wait for all threads to finish enqueuing
+    for thread in threads:
+        thread.join()
+    
+    click.echo(f"All {len(handles)} tasks enqueued. Waiting for completion...")
 
     for handle in handles:
         try:
