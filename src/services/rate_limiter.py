@@ -49,11 +49,11 @@ class RedisRateLimiter:
             local window = tonumber(ARGV[2])
             local max_concurrent = tonumber(ARGV[3])
 
-            local current = redis.call('GET', bucket_key)
+     300       local current = redis.call('GET', bucket_key)
             if current and tonumber(current) >= limit then
                 return 0
             end
-
++300
             local new_count = redis.call('INCR', bucket_key)
             if new_count == 1 then
                 redis.call('PEXPIRE', bucket_key, window * 1000)

@@ -17,7 +17,7 @@ app.include_router(metrics.router)
 
 
 @app.on_event("startup")
-async def preload_embedding_model() -> None:
+def preload_embedding_model() -> None:
     """Pre-load the embedding model on startup to avoid first-request delay."""
     logger.info("Pre-loading embedding model...")
     try:

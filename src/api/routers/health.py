@@ -14,7 +14,7 @@ router = APIRouter(prefix="/health", tags=["health"])
 
 
 @router.get("")
-async def health_check(session: Session = Depends(get_db_session)) -> dict[str, object]:
+def health_check(session: Session = Depends(get_db_session)) -> dict[str, object]:
     postgres_status = "connected"
     redis_status = "connected"
     worker_status = "unknown"

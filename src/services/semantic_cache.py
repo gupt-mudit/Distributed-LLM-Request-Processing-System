@@ -10,7 +10,9 @@ from sqlalchemy.orm import Session
 from src.models import PromptCacheEntry
 from src.models.prompt_cache_entry import EMBEDDING_DIMENSION
 from src.services import metrics
+import logging
 
+logger = logging.getLogger(__name__)
 DEFAULT_SIMILARITY_THRESHOLD = 0.9
 DEFAULT_LOOKBACK = timedelta(days=30)
 
@@ -60,8 +62,9 @@ class SemanticCacheService:
 
         if similarity < self._similarity_threshold:
             metrics.record_cache_miss()
+            logger.info(f"similarity is less than threshold, similarity: {similarity:.4f}")
             return None
-
+        logger.info(f"similarity is greater than threshold, similarity: {similarity:.4f}")
         metrics.record_cache_hit()
         return CacheHit(
             cache_entry_id=entry.id,

@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 @router.post("", response_model=ProcessResponse)
-async def process_prompt(
+def process_prompt(
     payload: ProcessRequest,
     session: Session = Depends(get_db_session),
     embedding_service=Depends(get_embedding_service),
@@ -142,7 +142,7 @@ async def process_prompt(
 
 
 @router.get("/{user_id}/{prompt_id}", response_model=ProcessResponse)
-async def get_prompt_status(
+def get_prompt_status(
     user_id: str,
     prompt_id: str,
     session: Session = Depends(get_db_session),
