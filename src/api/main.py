@@ -27,3 +27,13 @@ def preload_embedding_model() -> None:
         logger.info("Embedding model loaded successfully")
     except Exception as exc:
         logger.warning(f"Failed to pre-load embedding model: {exc}")
+
+    # Initialize MongoDB indexes
+    logger.info("Initializing MongoDB indexes...")
+    try:
+        from src.models.mongodb import init_mongodb_indexes
+
+        init_mongodb_indexes()
+        logger.info("MongoDB indexes initialized successfully")
+    except Exception as exc:
+        logger.warning(f"Failed to initialize MongoDB indexes: {exc}")

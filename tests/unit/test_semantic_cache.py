@@ -1,93 +1,98 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.models.prompt_cache_entry import EMBEDDING_DIMENSION, PromptCacheEntry
 from src.services.semantic_cache import CacheHit, SemanticCacheService
 
-
-def _make_entry(entry_id: int, response: str, hit_count: int = 0) -> PromptCacheEntry:
-    entry = PromptCacheEntry(
-        prompt_text="cached prompt",
-        embedding=[0.0] * 768,
-        response_text=response,
-    )
-    entry.id = entry_id  # type: ignore[attr-defined]
-    entry.hit_count = hit_count
-    entry.created_at = datetime.now(timezone.utc)
-    return entry
+EMBEDDING_DIMENSION = 384
 
 
 def test_lookup_returns_none_when_no_result() -> None:
-    session = MagicMock()
-    session.execute().first.return_value = None
-
+    """Test that lookup returns None when Qdrant returns no results."""
     service = SemanticCacheService(similarity_threshold=0.9)
-
-    result = service.lookup(session, [0.0] * EMBEDDING_DIMENSION)
-
-    assert result is None
+    
+    with patch.object(service._qdrant, 'search', return_value=[]):
+        result = service.lookup([0.0] * EMBEDDING_DIMENSION)
+        assert result is None
 
 
 def test_lookup_returns_hit_when_similarity_high() -> None:
-    entry = _make_entry(1, "cached response")
-    session = MagicMock()
-    session.execute().first.return_value = (entry, 0.95)
-
+    """Test that lookup returns CacheHit when similarity is above threshold."""
     service = SemanticCacheService(similarity_threshold=0.9)
-
-    result = service.lookup(session, [0.1] * EMBEDDING_DIMENSION)
-
-    assert isinstance(result, CacheHit)
-    assert result.cache_entry_id == 1
-    assert result.response_text == "cached response"
+    
+    mock_result = [{
+        "id": "point-1",
+        "score": 0.95,
+        "payload": {
+            "prompt_text": "cached prompt",
+            "response_text": "cached response",
+            "hit_count": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    }]
+    
+    with patch.object(service._qdrant, 'search', return_value=mock_result):
+        result = service.lookup([0.1] * EMBEDDING_DIMENSION)
+        
+        assert isinstance(result, CacheHit)
+        assert result.cache_entry_id == "point-1"
+        assert result.response_text == "cached response"
+        assert result.similarity == 0.95
 
 
 def test_lookup_returns_none_when_similarity_low() -> None:
-    entry = _make_entry(1, "cached response")
-    session = MagicMock()
-    session.execute().first.return_value = (entry, 0.5)
-
+    """Test that lookup returns None when similarity is below threshold."""
     service = SemanticCacheService(similarity_threshold=0.9)
-
-    result = service.lookup(session, [0.1] * EMBEDDING_DIMENSION)
-
-    assert result is None
+    
+    mock_result = [{
+        "id": "point-1",
+        "score": 0.5,  # Below threshold
+        "payload": {
+            "prompt_text": "cached prompt",
+            "response_text": "cached response",
+            "hit_count": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    }]
+    
+    with patch.object(service._qdrant, 'search', return_value=mock_result):
+        result = service.lookup([0.1] * EMBEDDING_DIMENSION)
+        assert result is None
 
 
 def test_record_hit_updates_entry() -> None:
-    entry = _make_entry(1, "cached")
-    session = MagicMock()
-    session.execute().scalar_one_or_none.return_value = entry
-
+    """Test that record_hit calls Qdrant's update_hit_count."""
     service = SemanticCacheService()
-    service.record_hit(session, 1)
-
-    assert entry.hit_count == 1
-    assert entry.last_hit_at is not None
-    session.add.assert_called_once_with(entry)
+    
+    with patch.object(service._qdrant, 'update_hit_count') as mock_update:
+        service.record_hit("point-1")
+        mock_update.assert_called_once_with("point-1")
 
 
 def test_store_persists_entry() -> None:
-    session = MagicMock()
-
+    """Test that store calls Qdrant's upsert and returns point ID."""
     service = SemanticCacheService()
-    entry = service.store(
-        session=session,
-        prompt_text="hello",
-        embedding=[0.1] * EMBEDDING_DIMENSION,
-        response_text="world",
-    )
-
-    session.add.assert_called_once_with(entry)
-    session.flush.assert_called_once()
+    
+    with patch.object(service._qdrant, 'upsert', return_value="point-123") as mock_upsert:
+        point_id = service.store(
+            prompt_text="hello",
+            embedding=[0.1] * EMBEDDING_DIMENSION,
+            response_text="world",
+        )
+        
+        assert point_id == "point-123"
+        mock_upsert.assert_called_once()
+        call_args = mock_upsert.call_args
+        assert call_args[1]["prompt_text"] == "hello"
+        assert call_args[1]["response_text"] == "world"
+        assert len(call_args[1]["vector"]) == EMBEDDING_DIMENSION
 
 
 def test_validate_embedding_dimension_mismatch() -> None:
+    """Test that lookup raises ValueError for wrong embedding dimension."""
     service = SemanticCacheService()
-    with pytest.raises(ValueError):
-        service.lookup(MagicMock(), [0.0])
-
+    with pytest.raises(ValueError, match="Embedding dimension mismatch"):
+        service.lookup([0.0] * 100)  # Wrong dimension

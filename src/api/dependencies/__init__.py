@@ -1,5 +1,5 @@
 
-from .session import get_db_session
+from .session import get_db_collection
 from .services import (
     get_cache_service,
     get_embedding_service,
@@ -9,7 +9,7 @@ from .services import (
 )
 
 __all__ = [
-    "get_db_session",
+    "get_db_collection",
     "get_cache_service",
     "get_embedding_service",
     "get_rate_limiter",

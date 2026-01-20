@@ -5,7 +5,7 @@ from typing import Optional
 
 from celery.result import AsyncResult
 
-from src.models import PromptRequest, PromptStatus
+# MongoDB models are used in routes, not here
 from src.worker import celery_app
 
 logger = logging.getLogger(__name__)

@@ -2,20 +2,21 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from pymongo.collection import Collection
 
 from src.api.dependencies import (
     get_cache_service,
-    get_db_session,
+    get_db_collection,
     get_embedding_service,
     get_prompt_task_client,
 )
 from src.api.schemas import ProcessRequest, ProcessResponse
-from src.models import PromptCacheEntry, PromptPriority, PromptRequest, PromptStatus
+from src.models.mongodb_models import PromptPriority, PromptStatus
+from src.services.qdrant_client import QdrantCacheService
 from src.services.semantic_cache import CacheHit
 
 router = APIRouter(prefix="/process", tags=["processing"])
@@ -26,81 +27,91 @@ logger = logging.getLogger(__name__)
 @router.post("", response_model=ProcessResponse)
 def process_prompt(
     payload: ProcessRequest,
-    session: Session = Depends(get_db_session),
+    collection: Collection = Depends(get_db_collection),
     embedding_service=Depends(get_embedding_service),
     cache_service=Depends(get_cache_service),
     task_client=Depends(get_prompt_task_client),
 ) -> ProcessResponse:
     start_time = time.perf_counter()
 
-    existing = (
-        session.execute(
-            select(PromptRequest)
-            .where(
-                PromptRequest.user_id == payload.user_id,
-                PromptRequest.prompt_id == payload.prompt_id,
-            )
-            .with_for_update()
-        ).scalar_one_or_none()
+    # Find existing request (atomic operation)
+    existing = collection.find_one(
+        {"user_id": payload.user_id, "prompt_id": payload.prompt_id}
     )
 
-    if existing and existing.status == PromptStatus.COMPLETED and existing.cache_entry_id:
-        cache_entry = session.get(PromptCacheEntry, existing.cache_entry_id)
-        if cache_entry:
-            cache_service.record_hit(session, cache_entry.id)
+    # If completed and has cache entry, return cached response
+    if (
+        existing
+        and existing.get("status") == PromptStatus.COMPLETED.value
+        and existing.get("cache_entry_id")
+    ):
+        qdrant = QdrantCacheService()
+        cache_point = qdrant.get(existing["cache_entry_id"])
+        if cache_point:
+            cache_service.record_hit(existing["cache_entry_id"])
             return ProcessResponse(
                 user_id=payload.user_id,
                 prompt_id=payload.prompt_id,
                 status=PromptStatus.COMPLETED.value,
                 cached=True,
-                response=cache_entry.response_text,
+                response=cache_point["payload"].get("response_text", ""),
                 processing_time_ms=int((time.perf_counter() - start_time) * 1000),
-                retry_count=existing.retry_count or 0,
+                retry_count=existing.get("retry_count", 0),
             )
 
-    if existing and existing.status in {PromptStatus.QUEUED, PromptStatus.PROCESSING}:
+    # If queued or processing, return current status
+    if existing and existing.get("status") in {
+        PromptStatus.QUEUED.value,
+        PromptStatus.PROCESSING.value,
+    }:
+        response_text = None
+        if existing.get("cache_entry_id"):
+            qdrant = QdrantCacheService()
+            cache_point = qdrant.get(existing["cache_entry_id"])
+            response_text = (
+                cache_point["payload"].get("response_text") if cache_point else None
+            )
+
         return ProcessResponse(
-            user_id=existing.user_id,
-            prompt_id=existing.prompt_id,
-            status=existing.status.value,
-            cached=bool(existing.cached),
-            response=(
-                session.get(PromptCacheEntry, existing.cache_entry_id).response_text
-                if existing.cache_entry_id
-                else None
-            ),
-            processing_time_ms=existing.processing_time_ms,
-            retry_count=existing.retry_count or 0,
-            error=existing.error_message,
+            user_id=existing["user_id"],
+            prompt_id=existing["prompt_id"],
+            status=existing["status"],
+            cached=existing.get("cached", False),
+            response=response_text,
+            processing_time_ms=existing.get("processing_time_ms"),
+            retry_count=existing.get("retry_count", 0),
+            error=existing.get("error_message"),
         )
 
-    if existing and existing.status == PromptStatus.FAILED:
+    # If failed, return failed status
+    if existing and existing.get("status") == PromptStatus.FAILED.value:
         return ProcessResponse(
-            user_id=existing.user_id,
-            prompt_id=existing.prompt_id,
+            user_id=existing["user_id"],
+            prompt_id=existing["prompt_id"],
             status=PromptStatus.FAILED.value,
             cached=False,
             response=None,
-            processing_time_ms=existing.processing_time_ms,
-            retry_count=existing.retry_count or 0,
-            error=existing.error_message,
+            processing_time_ms=existing.get("processing_time_ms"),
+            retry_count=existing.get("retry_count", 0),
+            error=existing.get("error_message"),
         )
 
+    # Generate embedding and check cache
     prompt_text = payload.text.strip()
     embedding = embedding_service.embed(prompt_text)
-    cache_hit = cache_service.lookup(session, embedding)
+    cache_hit = cache_service.lookup(embedding)
 
     if cache_hit:
-        cache_service.record_hit(session, cache_hit.cache_entry_id)
+        cache_service.record_hit(cache_hit.cache_entry_id)
         processing_time_ms = int((time.perf_counter() - start_time) * 1000)
         _persist_prompt_request(
-            session,
+            collection,
             payload=payload,
             status=PromptStatus.COMPLETED,
             cache_entry_id=cache_hit.cache_entry_id,
             cached=True,
             processing_time_ms=processing_time_ms,
-            retry_count=existing.retry_count if existing else 0,
+            retry_count=existing.get("retry_count", 0) if existing else 0,
         )
         return ProcessResponse(
             user_id=payload.user_id,
@@ -109,53 +120,61 @@ def process_prompt(
             cached=True,
             response=cache_hit.response_text,
             processing_time_ms=processing_time_ms,
-            retry_count=existing.retry_count if existing else 0,
+            retry_count=existing.get("retry_count", 0) if existing else 0,
         )
 
-    request = existing or PromptRequest(
-        user_id=payload.user_id,
-        prompt_id=payload.prompt_id,
-        prompt_text=prompt_text,
-        priority=PromptPriority(payload.priority),
-        status=PromptStatus.QUEUED,
-    )
-    request.prompt_text = prompt_text
-    request.priority = PromptPriority(payload.priority)
-    request.status = PromptStatus.QUEUED
-    request.cached = False
-    request.retry_count = existing.retry_count if existing else 0
-    session.add(request)
-    session.flush()
-    session.commit()
-    session.refresh(request)
+    # Cache miss - create request and enqueue task
+    now = datetime.now(timezone.utc)
+    request_doc = {
+        "user_id": payload.user_id,
+        "prompt_id": payload.prompt_id,
+        "prompt_text": prompt_text,
+        "status": PromptStatus.QUEUED.value,
+        "priority": payload.priority,
+        "cached": False,
+        "retry_count": existing.get("retry_count", 0) if existing else 0,
+        "processing_time_ms": None,
+        "error_message": None,
+        "cache_entry_id": None,
+        "created_at": existing.get("created_at", now) if existing else now,
+        "updated_at": now,
+    }
 
-    result = task_client.enqueue(
+    # Upsert (atomic operation)
+    collection.update_one(
+        {"user_id": payload.user_id, "prompt_id": payload.prompt_id},
+        {"$set": request_doc},
+        upsert=True,
+    )
+
+    # Enqueue task for background processing
+    task_client.enqueue(
         user_id=payload.user_id,
         prompt_id=payload.prompt_id,
         text=prompt_text,
         priority=payload.priority,
     )
 
-    task_result = _wait_for_result(result, timeout_seconds=120)
-
-    return ProcessResponse(**task_result)
+    # Return immediately - client should poll GET /process/{user_id}/{prompt_id} for status
+    return ProcessResponse(
+        user_id=payload.user_id,
+        prompt_id=payload.prompt_id,
+        status=PromptStatus.QUEUED.value,
+        cached=False,
+        response=None,
+        processing_time_ms=None,
+        retry_count=existing.get("retry_count", 0) if existing else 0,
+        error=None,
+    )
 
 
 @router.get("/{user_id}/{prompt_id}", response_model=ProcessResponse)
 def get_prompt_status(
     user_id: str,
     prompt_id: str,
-    session: Session = Depends(get_db_session),
+    collection: Collection = Depends(get_db_collection),
 ) -> ProcessResponse:
-    request = (
-        session.execute(
-            select(PromptRequest)
-            .where(
-                PromptRequest.user_id == user_id,
-                PromptRequest.prompt_id == prompt_id,
-            )
-        ).scalar_one_or_none()
-    )
+    request = collection.find_one({"user_id": user_id, "prompt_id": prompt_id})
 
     if request is None:
         raise HTTPException(
@@ -164,74 +183,49 @@ def get_prompt_status(
         )
 
     response_text = None
-    if request.cache_entry_id:
-        cache_entry = session.get(PromptCacheEntry, request.cache_entry_id)
-        response_text = cache_entry.response_text if cache_entry else None
+    if request.get("cache_entry_id"):
+        qdrant = QdrantCacheService()
+        cache_point = qdrant.get(request["cache_entry_id"])
+        response_text = (
+            cache_point["payload"].get("response_text") if cache_point else None
+        )
 
     return ProcessResponse(
-        user_id=request.user_id,
-        prompt_id=request.prompt_id,
-        status=request.status.value,
-        cached=bool(request.cached),
+        user_id=request["user_id"],
+        prompt_id=request["prompt_id"],
+        status=request.get("status", PromptStatus.QUEUED.value),
+        cached=request.get("cached", False),
         response=response_text,
-        processing_time_ms=request.processing_time_ms,
-        retry_count=request.retry_count or 0,
-        error=request.error_message,
-    )
-
-
-def _wait_for_result(result, timeout_seconds: int = 30) -> Optional[dict[str, object]]:
-    try:
-        payload = result.get(timeout=timeout_seconds, propagate=False)
-    except Exception as exc:  # pragma: no cover - unexpected celery failure
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    if isinstance(payload, dict):
-        return payload
-
-    if isinstance(payload, Exception):
-        raise HTTPException(status_code=500, detail=str(payload))
-
-    raise HTTPException(
-        status_code=500,
-        detail="Unexpected task result payload.",
+        processing_time_ms=request.get("processing_time_ms"),
+        retry_count=request.get("retry_count", 0),
+        error=request.get("error_message"),
     )
 
 
 def _persist_prompt_request(
-    session: Session,
+    collection: Collection,
     *,
     payload: ProcessRequest,
     status: PromptStatus,
-    cache_entry_id: Optional[int],
+    cache_entry_id: Optional[str],
     cached: bool,
     processing_time_ms: Optional[int],
     retry_count: int,
 ) -> None:
-    request = (
-        session.execute(
-            select(PromptRequest)
-            .where(
-                PromptRequest.user_id == payload.user_id,
-                PromptRequest.prompt_id == payload.prompt_id,
-            )
-            .with_for_update()
-        ).scalar_one_or_none()
+    """Update or create a prompt request document."""
+    now = datetime.now(timezone.utc)
+    update_doc = {
+        "status": status.value,
+        "cache_entry_id": cache_entry_id,
+        "cached": cached,
+        "processing_time_ms": processing_time_ms,
+        "retry_count": retry_count,
+        "prompt_text": payload.text,
+        "updated_at": now,
+    }
+
+    collection.update_one(
+        {"user_id": payload.user_id, "prompt_id": payload.prompt_id},
+        {"$set": update_doc},
+        upsert=True,
     )
-    if request is None:
-        request = PromptRequest(
-            user_id=payload.user_id,
-            prompt_id=payload.prompt_id,
-            prompt_text=payload.text,
-            priority=PromptPriority(payload.priority),
-        )
-        session.add(request)
-        session.flush()
-
-    request.status = status
-    request.cache_entry_id = cache_entry_id
-    request.cached = cached
-    request.processing_time_ms = processing_time_ms
-    request.retry_count = retry_count
-    request.prompt_text = payload.text
-

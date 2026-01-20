@@ -2,10 +2,11 @@
 
 ## Architecture Summary
 
-- **FastAPI** provides the REST layer. `POST /process` validates the request, runs a semantic cache lookup, and, on a miss, enqueues a Celery task while blocking until the result arrives (up to the configured timeout). `GET /process/{user}/{prompt}` surfaces status for dashboards or tooling, and `GET /metrics` exposes Prometheus metrics.
+- **FastAPI** provides the REST layer. `POST /process` validates the request, runs a semantic cache lookup, and, on a miss, enqueues a Celery task and returns immediately with `status="queued"`. Clients poll `GET /process/{user}/{prompt}` for status updates. `GET /metrics` exposes Prometheus metrics.
 - **Celery** is the durable execution engine. I use Redis for both broker and result backend, `task_acks_late=True`, `task_reject_on_worker_lost=True`, and `worker_prefetch_multiplier=1` so a task that crashes midway is redelivered to another worker.
 - **Priority queues**: I configured Celery with three queues (`prompt_high`, `prompt_normal`, `prompt_low`). The API routes each request based on the declared priority, so high-priority prompts jump the backlog. A single worker listens to all three queues in priority order; additional workers can be added later (see Trade-offs).
-- **PostgreSQL + pgvector** store prompt metadata and cached responses. `ivfflat` indexes over pgvector (cosine distance) let me do fast similarity lookups, and the `(user_id, prompt_id)` unique constraint makes the API idempotent.
+- **MongoDB** stores prompt metadata (requests, status, retry counts). Unique index on `(user_id, prompt_id)` makes the API idempotent.
+- **Qdrant** stores vector embeddings and handles similarity search. Optimized for high-performance vector operations at scale.
 - **Redis** also backs the rate limiter—a Lua-script token bucket capped at 300 calls per minute plus a concurrency guard (defaults to 5 in-flight LLM calls).
 - **Services layer** hides implementation details:
   - `EmbeddingService` loads `sentence-transformers` (or a deterministic fallback in tests).
@@ -16,7 +17,7 @@
 ### Why these choices?
 - **FastAPI** keeps request validation simple, supports async handlers, and plays nicely with Pydantic & Prometheus middleware. Alternatives such as Flask or Django REST were heavier for the scope.
 - **Celery + Redis** were picked over a Temporal/Prefect deployment because they’re easy to containerise, widely understood, and robust enough for retries and crash recovery. Temporal would add strong guarantees but needs a larger footprint.
-- **PostgreSQL** handles the write-heavy workload, transactionally updates status/retry counts, and with `pgvector` I avoid running a separate vector database.
+- **MongoDB** handles the write-heavy workload with excellent horizontal scaling. **Qdrant** provides specialized vector search capabilities optimized for similarity queries at scale.
 - **Python 3.11** for structural pattern matching, `taskgroups`, and performance improvements. Go was considered but Python’s ecosystem (sentence-transformers, Celery) offered more out of the box for LLM workloads.
 
 ## Prompt Processing Flow
@@ -26,16 +27,19 @@
         | Client  | ----->  |  API    | ----->  |  Celery   |
         +---------+         +---------+         +-----------+
                                  |                    |
-                                 v                    v
-                           +-----------+        +------------+
-                           | Postgres  | <----> |  Worker    |
-                           +-----------+        +------------+
-                                 ^                    |
-                                 |                    v
-                           +-----------+        +------------+
-                           | Semantic  |        |  Redis     |
-                           |  Cache    |        | (Limiter)  |
-                           +-----------+        +------------+
+                    +------------+                    +------------+
+                    |                                  |
+                    v                                  v
+           +-------------+                    +-------------+
+           |  MongoDB    |                    |   Worker    |
+           | (Metadata)  |                    +-------------+
+           +-------------+                           |
+                    ^                                  |
+                    |                                  v
+           +-------------+                    +-------------+
+           |   Qdrant    |                    |   Redis     |
+           |  (Vectors)  |                    | (Limiter)   |
+           +-------------+                    +-------------+
                                                      |
                                                      v
                                                +------------+
@@ -43,25 +47,25 @@
                                                +------------+
 
        1. Client calls `POST /process`.
-       2. API locks/upserts `PromptRequest` in Postgres.
-       3. API checks semantic cache; if hit, return response immediately.
+       2. API upserts `PromptRequest` in MongoDB (atomic operation).
+       3. API checks semantic cache in Qdrant; if hit, return response immediately.
        4. On miss, API enqueues `prompt.process` task on priority queue.
-       5. Worker pulls task, rechecks cache, and acquires Redis token.
-       6. Worker calls Mock LLM, stores response + embedding in Postgres.
-       7. Worker updates request status; Celery returns result to API.
+       5. Worker pulls task, rechecks cache in Qdrant, and acquires Redis token.
+       6. Worker calls Mock LLM, stores response + embedding in Qdrant and metadata in MongoDB.
+       7. Worker updates request status in MongoDB; Celery returns result to API.
        8. API replies to client with completed payload.
 ```
 
 1. Client issues `POST /process`.
-2. The API upserts the `PromptRequest` row (locking via `SELECT … FOR UPDATE`), short-circuits to a cached response when similarity ≥ 0.9, otherwise persists the request as `queued`.
+2. The API upserts the `PromptRequest` document in MongoDB (atomic `update_one` with `upsert=True`), short-circuits to a cached response from Qdrant when similarity ≥ 0.9, otherwise persists the request as `queued`.
 3. The request is routed to the Celery queue that matches the priority and `apply_async` returns an AsyncResult.
-4. The API blocks on `result.get` (120s by default). If another worker already finished the prompt, we return the finished payload immediately; if the deadline passes or the task fails after max retries, the error is surfaced in the HTTP response.
-5. The worker re-checks the cache (to avoid duplicate LLM calls), invokes the rate-limited `MockLLM`, and stores the result (embedding, response, timestamps) back into the cache and request tables.
+4. The API returns immediately with `status="queued"`. The client should poll `GET /process/{user_id}/{prompt_id}` for status updates.
+5. The worker re-checks the cache in Qdrant (to avoid duplicate LLM calls), invokes the rate-limited `MockLLM`, and stores the result (embedding in Qdrant, metadata in MongoDB).
 
 ## Data Model
 
-- `PromptRequest`: user/prompt identifiers, text, priority, status, retry count, processing time, cache link, last error. Unique per `(user_id, prompt_id)` and updated atomically inside transactions.
-- `PromptCacheEntry`: prompt text, embedding vector, response, `hit_count`, `created_at`, `last_hit_at`. `ivfflat` index on the embedding column for quick similarity lookup.
+- **MongoDB (`prompt_requests` collection)**: user/prompt identifiers, text, priority, status, retry count, processing time, cache entry ID (Qdrant point ID), last error. Unique index on `(user_id, prompt_id)` for idempotency.
+- **Qdrant (`prompt_cache` collection)**: vector embeddings (384 dimensions), payload containing prompt text, response text, `hit_count`, `created_at`, `last_hit_at`. Optimized HNSW index for fast similarity search.
 
 ## Rate Limiting & Backpressure
 
@@ -71,8 +75,8 @@
 
 ## Resilience Measures
 
-- Celery with `acks_late` + Redis broker ensures tasks aren’t lost. If the worker dies mid-flight, the task is requeued once the visibility timeout expires.
-- Worker code reselects the `PromptRequest` row using `SELECT … FOR UPDATE`; if a duplicate insert occurs (common after crash recovery) I reload the existing row instead of failing.
+- Celery with `acks_late` + Redis broker ensures tasks aren't lost. If the worker dies mid-flight, the task is requeued once the visibility timeout expires.
+- Worker code uses MongoDB's atomic `update_one` with `upsert=True`; if a duplicate insert occurs (common after crash recovery) it updates the existing document instead of failing.
 - `scripts/test_resilience.sh` proves it: it posts a prompt, kills the worker, restarts it, and waits until the job returns `completed`.
 - Error handling bubbles provider failures back into `PromptRequest.error` and the HTTP payload (`"error": "...", "retry_count": n`).
 
@@ -102,7 +106,7 @@
 ## Alternatives & Trade-offs
 
 - **Workflow orchestration**: I evaluated Temporal/Prefect. Temporal provides temporal workflows and guarantees but requires separate infrastructure and steeper learning curve. Celery/Redis gave me exactly-once semantics good enough for this exercise with minimal overhead.
-- **Database choice**: MongoDB with Atlas Vector Search was considered. Postgres + pgvector won because I needed transactional updates, strong consistency for retry bookkeeping, and I could avoid running an additional vector store.
+- **Database choice**: I chose MongoDB for metadata storage due to its excellent write performance and horizontal scaling capabilities. Qdrant was chosen for vector search as it's optimized specifically for similarity queries and can handle millions of vectors efficiently. This separation allows each database to scale independently based on workload.
 - **Rate limiting location**: Putting the limiter in the API would have reduced worker complexity but would have tied up the HTTP request thread during wait time. Keeping it in the worker ensures compliance even if multiple gateway instances exist.
 - **Priority implementation**: The current multi-queue approach is simple and preserves FIFO order within each priority. For stricter isolation I could:
   - Run dedicated workers per priority queue.

@@ -1,12 +1,8 @@
-from .base import Base
-from .prompt_cache_entry import PromptCacheEntry
-from .prompt_request import PromptPriority, PromptRequest, PromptStatus
+from .mongodb_models import PromptPriority, PromptRequestDoc, PromptStatus
 
 __all__ = [
-    "Base",
-    "PromptRequest",
+    "PromptRequestDoc",
     "PromptStatus",
     "PromptPriority",
-    "PromptCacheEntry",
 ]
 

@@ -1,23 +1,14 @@
 from __future__ import annotations
 
-from __future__ import annotations
-
 from typing import Generator
 
-from sqlalchemy.orm import Session
+from pymongo.collection import Collection
 
-from src.models.database import get_session_factory
+from src.models.mongodb import get_prompt_requests_collection
 
 
-def get_db_session() -> Generator[Session, None, None]:
-    session_factory = get_session_factory()
-    session = session_factory()
-    try:
-        yield session
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+def get_db_collection() -> Generator[Collection, None, None]:
+    """Get MongoDB collection for prompt_requests."""
+    collection = get_prompt_requests_collection()
+    yield collection
 

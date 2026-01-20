@@ -1,12 +1,12 @@
 # Prompt Processing System
 
 FastAPI service that queues prompt-processing jobs, checks a semantic cache
-(`pgvector` in PostgreSQL), enforces a global LLM rate limit through Redis, and
+(Qdrant for vector search), enforces a global LLM rate limit through Redis, and
 executes work durably with Celery workers.
 
-`POST /process` is synchronous: the request blocks until the prompt is processed
-(or a cache hit is returned). This includes retrying work transparently if a
-worker crashes mid-flight.
+`POST /process` returns immediately with a queued status. Clients should poll
+`GET /process/{user_id}/{prompt_id}` for status updates. Cache hits return
+immediately with the cached response.
 
 ## Repository Layout
 
@@ -17,7 +17,7 @@ worker crashes mid-flight.
 │   ├── api/                   # FastAPI app, routers, dependency wiring
 │   ├── services/              # Embeddings, semantic cache, rate limiter, mock LLM
 │   ├── worker/                # Celery app and task implementation
-│   └── models/                # SQLAlchemy models + Alembic migrations
+│   └── models/                # MongoDB document models
 ├── tests/                     # Unit & integration tests
 └── scripts/
     └── test_resilience.sh     # Worker crash-recovery smoke test
@@ -27,19 +27,18 @@ worker crashes mid-flight.
 
 1. **Prerequisites**
    - Docker & Docker Compose
-   - Make sure ports `8000`, `5432`, `6379` are available
+   - Make sure ports `8000`, `27017`, `6333`, `6379` are available
 
 2. **Configuration**
    - Copy `config/env.example` to `.env` (or edit the example file) if you need to
      override defaults such as database credentials or embedding model name.
 
-3. **Boot the stack (migrations run automatically)**
+3. **Boot the stack**
    ```bash
    docker compose up --build
    ```
-   This starts PostgreSQL (with `pgvector`), Redis, the FastAPI app, Celery worker,
-   and Celery beat scheduler. The API container’s entrypoint applies Alembic
-   migrations before Uvicorn launches, so the schema is always up to date.
+   This starts MongoDB, Qdrant (vector database), Redis, the FastAPI app, Celery worker,
+   and Celery beat scheduler. MongoDB indexes are created automatically on startup.
 
 4. **Verify**
    - Health check: `curl http://localhost:8000/health`
@@ -52,7 +51,7 @@ worker crashes mid-flight.
 
 ## API Endpoints
 
-- `POST /process` – submit a prompt. Returns the completed result (or cached response) before the HTTP call finishes.
+- `POST /process` – submit a prompt. Returns immediately with `status="queued"` (or cached response if cache hit). Poll `GET /process/{user_id}/{prompt_id}` for status updates.
 - `GET /process/{user_id}/{prompt_id}` – read the latest status/result without re-processing, useful for polling or dashboards.
 - `GET /health` – component health snapshot for load balancers/monitors.
 
@@ -62,7 +61,7 @@ worker crashes mid-flight.
   ```bash
   docker compose exec api poetry run pytest
   ```
-  (Adjust command if you prefer running locally with a configured `DATABASE_URL`/Redis.)
+  (Adjust command if you prefer running locally with configured MongoDB/Qdrant/Redis.)
 
 - Resilience script (kills the worker mid-flight and verifies recovery):
   ```bash
@@ -96,7 +95,7 @@ worker crashes mid-flight.
 ## Key Features
 
 - **Semantic caching**: embeddings via `sentence-transformers` (or deterministic mock)
-  stored in PostgreSQL with `pgvector`, similarity threshold 0.9.
+  stored in Qdrant (vector database), similarity threshold 0.9.
 - **Rate limiting**: Redis-backed token bucket + concurrency guard to maintain 300
   LLM calls per minute across all workers.
 - **Durable execution**: Celery configured with late acknowledgements, retry/backoff,
