@@ -55,12 +55,8 @@ celery_app.conf.task_queues = (
 )
 celery_app.conf.task_default_queue = "prompt_normal"
 celery_app.conf.task_default_exchange_type = "direct"
-celery_app.conf.task_routes = {
-    "prompt.process": {
-        "queue": "prompt_normal",
-        "routing_key": "prompt_normal",
-    }
-}
+# Note: Task routing is handled dynamically in PromptTaskClient.enqueue()
+# based on priority, so we don't hardcode routes here
 
 
 @celery_app.task(name="health.check")

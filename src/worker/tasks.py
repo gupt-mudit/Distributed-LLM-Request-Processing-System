@@ -4,9 +4,10 @@ import logging
 import math
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from celery import Task
+from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from src.models.mongodb import get_prompt_requests_collection
@@ -122,40 +123,53 @@ def process_prompt(self: Task, payload: Dict[str, Any]) -> Dict[str, Any]:
             request["prompt_text"] = prompt_text
             request["priority"] = priority.value
 
-        # Check if already completed with cache
+        # Check if already completed with cache (atomic check)
         if (
             request.get("status") == PromptStatus.COMPLETED.value
             and request.get("cache_entry_id")
         ):
-            from src.services.qdrant_client import QdrantCacheService
-
-            qdrant = QdrantCacheService()
-            cache_point = qdrant.get(request["cache_entry_id"])
-            if cache_point:
-                _cache_service.record_hit(request["cache_entry_id"])
-                elapsed = int((time.perf_counter() - start_time) * 1000)
-                logger.info(
-                    "Returning cached response for completed request",
+            try:
+                cache_point = _cache_service._qdrant.get(request["cache_entry_id"])
+                if cache_point:
+                    _cache_service.record_hit(request["cache_entry_id"])
+                    elapsed = int((time.perf_counter() - start_time) * 1000)
+                    logger.info(
+                        "Returning cached response for completed request",
+                        extra={
+                            "user_id": user_id,
+                            "prompt_id": prompt_id,
+                        },
+                    )
+                    result_payload = _build_result(
+                        user_id=user_id,
+                        prompt_id=prompt_id,
+                        status=PromptStatus.COMPLETED,
+                        response_text=cache_point["payload"].get("response_text", ""),
+                        cached=True,
+                        retry_count=self.request.retries,
+                        processing_time_ms=elapsed,
+                        error=None,
+                    )
+                    return result_payload
+            except Exception as exc:
+                logger.warning(
+                    "Failed to retrieve cache entry, will reprocess",
                     extra={
                         "user_id": user_id,
                         "prompt_id": prompt_id,
+                        "error": str(exc),
                     },
                 )
-                result_payload = _build_result(
-                    user_id=user_id,
-                    prompt_id=prompt_id,
-                    status=PromptStatus.COMPLETED,
-                    response_text=cache_point["payload"].get("response_text", ""),
-                    cached=True,
-                    retry_count=self.request.retries,
-                    processing_time_ms=elapsed,
-                )
-                return result_payload
+                # Continue processing if cache retrieval fails
 
-        # Update status to processing
+        # Atomically update status to processing (only if currently QUEUED or RECEIVED)
         now = datetime.now(timezone.utc)
-        collection.update_one(
-            {"user_id": user_id, "prompt_id": prompt_id},
+        updated_request = collection.find_one_and_update(
+            {
+                "user_id": user_id,
+                "prompt_id": prompt_id,
+                "status": {"$in": [PromptStatus.QUEUED.value, PromptStatus.RECEIVED.value, PromptStatus.PROCESSING.value]},
+            },
             {
                 "$set": {
                     "status": PromptStatus.PROCESSING.value,
@@ -165,7 +179,41 @@ def process_prompt(self: Task, payload: Dict[str, Any]) -> Dict[str, Any]:
                     "updated_at": now,
                 }
             },
+            return_document=ReturnDocument.AFTER,
         )
+        
+        # If update failed, another worker is processing or it's already completed
+        if not updated_request:
+            logger.info(
+                "Request already processed by another worker or completed",
+                extra={
+                    "user_id": user_id,
+                    "prompt_id": prompt_id,
+                },
+            )
+            # Re-fetch to get current status
+            request = collection.find_one({"user_id": user_id, "prompt_id": prompt_id})
+            if request and request.get("status") == PromptStatus.COMPLETED.value:
+                # Return the completed result
+                try:
+                    cache_entry_id = request.get("cache_entry_id")
+                    if cache_entry_id:
+                        cache_point = _cache_service._qdrant.get(cache_entry_id)
+                        if cache_point:
+                            return _build_result(
+                                user_id=user_id,
+                                prompt_id=prompt_id,
+                                status=PromptStatus.COMPLETED,
+                                response_text=cache_point["payload"].get("response_text", ""),
+                                cached=True,
+                                retry_count=self.request.retries,
+                                processing_time_ms=0,
+                                error=None,
+                            )
+                except Exception:
+                    pass
+            # If we can't return completed result, raise to retry
+            raise RuntimeError("Request status changed, will retry")
 
         # Generate embedding and check cache
         embedding = _embedding_service.embed(prompt_text)
@@ -203,6 +251,7 @@ def process_prompt(self: Task, payload: Dict[str, Any]) -> Dict[str, Any]:
                 cached=True,
                 retry_count=self.request.retries,
                 processing_time_ms=processing_time_ms,
+                error=None,
             )
         else:
             try:
@@ -278,6 +327,7 @@ def process_prompt(self: Task, payload: Dict[str, Any]) -> Dict[str, Any]:
                     cached=False,
                     retry_count=self.request.retries,
                     processing_time_ms=processing_time_ms,
+                    error=None,
                 )
 
     except Exception as exc:
@@ -316,6 +366,7 @@ def _build_result(
     cached: bool,
     retry_count: int,
     processing_time_ms: int,
+    error: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "user_id": user_id,
@@ -325,6 +376,7 @@ def _build_result(
         "response": response_text,
         "retry_count": retry_count,
         "processing_time_ms": processing_time_ms,
+        "error": error,
     }
 
 

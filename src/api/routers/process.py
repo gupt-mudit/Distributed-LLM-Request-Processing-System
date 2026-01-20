@@ -16,7 +16,6 @@ from src.api.dependencies import (
 )
 from src.api.schemas import ProcessRequest, ProcessResponse
 from src.models.mongodb_models import PromptPriority, PromptStatus
-from src.services.qdrant_client import QdrantCacheService
 from src.services.semantic_cache import CacheHit
 
 router = APIRouter(prefix="/process", tags=["processing"])
@@ -45,19 +44,29 @@ def process_prompt(
         and existing.get("status") == PromptStatus.COMPLETED.value
         and existing.get("cache_entry_id")
     ):
-        qdrant = QdrantCacheService()
-        cache_point = qdrant.get(existing["cache_entry_id"])
-        if cache_point:
-            cache_service.record_hit(existing["cache_entry_id"])
-            return ProcessResponse(
-                user_id=payload.user_id,
-                prompt_id=payload.prompt_id,
-                status=PromptStatus.COMPLETED.value,
-                cached=True,
-                response=cache_point["payload"].get("response_text", ""),
-                processing_time_ms=int((time.perf_counter() - start_time) * 1000),
-                retry_count=existing.get("retry_count", 0),
+        try:
+            cache_point = cache_service._qdrant.get(existing["cache_entry_id"])
+            if cache_point:
+                cache_service.record_hit(existing["cache_entry_id"])
+                return ProcessResponse(
+                    user_id=payload.user_id,
+                    prompt_id=payload.prompt_id,
+                    status=PromptStatus.COMPLETED.value,
+                    cached=True,
+                    response=cache_point["payload"].get("response_text", ""),
+                    processing_time_ms=int((time.perf_counter() - start_time) * 1000),
+                    retry_count=existing.get("retry_count", 0),
+                )
+        except Exception as exc:
+            logger.warning(
+                "Failed to retrieve cache entry, will continue processing",
+                extra={
+                    "user_id": payload.user_id,
+                    "prompt_id": payload.prompt_id,
+                    "error": str(exc),
+                },
             )
+            # Continue to cache lookup below
 
     # If queued or processing, return current status
     if existing and existing.get("status") in {
@@ -66,11 +75,21 @@ def process_prompt(
     }:
         response_text = None
         if existing.get("cache_entry_id"):
-            qdrant = QdrantCacheService()
-            cache_point = qdrant.get(existing["cache_entry_id"])
-            response_text = (
-                cache_point["payload"].get("response_text") if cache_point else None
-            )
+            try:
+                cache_point = cache_service._qdrant.get(existing["cache_entry_id"])
+                response_text = (
+                    cache_point["payload"].get("response_text") if cache_point else None
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to retrieve cache entry for queued/processing request",
+                    extra={
+                        "user_id": existing.get("user_id"),
+                        "prompt_id": existing.get("prompt_id"),
+                        "error": str(exc),
+                    },
+                )
+                response_text = None
 
         return ProcessResponse(
             user_id=existing["user_id"],
@@ -173,6 +192,7 @@ def get_prompt_status(
     user_id: str,
     prompt_id: str,
     collection: Collection = Depends(get_db_collection),
+    cache_service=Depends(get_cache_service),
 ) -> ProcessResponse:
     request = collection.find_one({"user_id": user_id, "prompt_id": prompt_id})
 
@@ -184,11 +204,21 @@ def get_prompt_status(
 
     response_text = None
     if request.get("cache_entry_id"):
-        qdrant = QdrantCacheService()
-        cache_point = qdrant.get(request["cache_entry_id"])
-        response_text = (
-            cache_point["payload"].get("response_text") if cache_point else None
-        )
+        try:
+            cache_point = cache_service._qdrant.get(request["cache_entry_id"])
+            response_text = (
+                cache_point["payload"].get("response_text") if cache_point else None
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to retrieve cache entry",
+                extra={
+                    "user_id": user_id,
+                    "prompt_id": prompt_id,
+                    "error": str(exc),
+                },
+            )
+            response_text = None
 
     return ProcessResponse(
         user_id=request["user_id"],

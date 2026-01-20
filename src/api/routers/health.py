@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 
 import redis
@@ -28,7 +29,8 @@ def health_check() -> dict[str, object]:
 
     # Check Redis
     try:
-        redis_client = redis.Redis.from_url("redis://redis:6379/0")
+        redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+        redis_client = redis.Redis.from_url(redis_url)
         redis_client.ping()
     except Exception as exc:  # pragma: no cover - redis failure
         redis_status = f"error: {exc}"
@@ -42,10 +44,10 @@ def health_check() -> dict[str, object]:
 
     # Check Qdrant
     try:
-        from src.services.qdrant_client import QdrantCacheService
+        from src.api.dependencies import get_cache_service
 
-        qdrant = QdrantCacheService()
-        qdrant._client.get_collections()
+        cache_service = get_cache_service()
+        cache_service._qdrant._client.get_collections()
         qdrant_status = "connected"
     except Exception as exc:  # pragma: no cover - Qdrant failure
         qdrant_status = f"error: {exc}"
