@@ -27,30 +27,46 @@ class QdrantCacheService:
         self._ensure_collection()
 
     def _ensure_collection(self) -> None:
-        """Create collection if it doesn't exist."""
+        """Create collection if it doesn't exist.
+        
+        Uses idempotent pattern: try to create, ignore if already exists.
+        Handles race condition where multiple processes try to create
+        the same collection simultaneously.
+        """
+        from qdrant_client.http.exceptions import UnexpectedResponse
+        
         try:
+            # Try to get collection first (fast path)
             self._client.get_collection(self._collection)
-            # Collection exists, nothing to do
+            return
+        except UnexpectedResponse as e:
+            if e.status_code != 404:
+                raise  # Re-raise non-404 errors (auth, server errors, etc.)
         except Exception:
-            # Collection doesn't exist, create it
-            try:
-                self._client.create_collection(
-                    collection_name=self._collection,
-                    vectors_config=VectorParams(
-                        size=self._embedding_dimension,
-                        distance=Distance.COSINE,
-                    ),
-                )
-            except Exception as exc:
-                # Handle case where collection was created by another process
-                if "already exists" in str(exc) or "409" in str(exc):
-                    # Collection exists now, verify it
-                    try:
-                        self._client.get_collection(self._collection)
-                    except Exception:
-                        raise
-                else:
-                    raise
+            # Handle non-HTTP exceptions (connection errors, etc.)
+            # Re-raise to avoid hiding real errors
+            raise
+        
+        # Collection doesn't exist, create it
+        try:
+            self._client.create_collection(
+                collection_name=self._collection,
+                vectors_config=VectorParams(
+                    size=self._embedding_dimension,
+                    distance=Distance.COSINE,
+                ),
+            )
+        except UnexpectedResponse as e:
+            # If collection already exists (race condition), that's fine
+            if e.status_code == 409:
+                # Another process created it - verify it exists
+                self._client.get_collection(self._collection)
+                return
+            # Other HTTP errors should be raised
+            raise
+        except Exception:
+            # Handle non-HTTP exceptions (connection errors, etc.)
+            raise
 
     def search(
         self,
