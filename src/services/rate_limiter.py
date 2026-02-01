@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Optional
@@ -16,7 +17,8 @@ DEFAULT_CONCURRENCY_LIMIT = 5
 
 
 class RedisRateLimiter:
-    """Token-bucket rate limiter with optional concurrency control."""
+    """Token-bucket rate limiter with optional concurrency control.
+    """
 
     def __init__(
         self,
@@ -36,43 +38,79 @@ class RedisRateLimiter:
         self._window = window_seconds
         self._max_concurrent = max(0, max_concurrent)  # 0 disables concurrency guard
         self._namespace = namespace
+        
+        # Token bucket parameters
+        self._capacity = limit_per_minute  # Max tokens (bucket size)
+        self._refill_rate = limit_per_minute / window_seconds  # Tokens per second
 
         redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
         self._client = redis.Redis.from_url(redis_url)
 
-        # Lua scripts for atomic operations.
+        # Lua script for token bucket with atomic operations.
+        # Uses Redis hash to store: tokens (current count) and last_refill (timestamp)
         self._acquire_script = self._client.register_script(
             """
             local bucket_key = KEYS[1]
             local concurrency_key = KEYS[2]
-            local limit = tonumber(ARGV[1])
-            local window = tonumber(ARGV[2])
-            local max_concurrent = tonumber(ARGV[3])
+            local capacity = tonumber(ARGV[1])
+            local refill_rate = tonumber(ARGV[2])
+            local current_time = tonumber(ARGV[3])
+            local max_concurrent = tonumber(ARGV[4])
+            local expiration_ms = tonumber(ARGV[5])
 
-            local current = redis.call('GET', bucket_key)
-            if current and tonumber(current) >= limit then
-                return 0
+            -- Get or initialize bucket state (stored as Redis hash)
+            local bucket_data = redis.call('HMGET', bucket_key, 'tokens', 'last_refill')
+            local tokens = bucket_data[1]
+            local last_refill = bucket_data[2]
+
+            if not tokens then
+                -- First request: initialize bucket with full capacity
+                tokens = capacity
+                last_refill = current_time
+                redis.call('HMSET', bucket_key, 'tokens', tokens, 'last_refill', last_refill)
+                redis.call('PEXPIRE', bucket_key, expiration_ms)
+            else
+                tokens = tonumber(tokens)
+                last_refill = tonumber(last_refill)
+                
+                -- Calculate elapsed time and refill tokens
+                local elapsed = current_time - last_refill
+                if elapsed > 0 then
+                    -- Refill tokens based on elapsed time (capped at capacity)
+                    local tokens_to_add = elapsed * refill_rate
+                    tokens = math.min(capacity, tokens + tokens_to_add)
+                    last_refill = current_time
+                end
             end
 
-            local new_count = redis.call('INCR', bucket_key)
-            if new_count == 1 then
-                redis.call('PEXPIRE', bucket_key, window * 1000)
+            -- Check if we have enough tokens
+            if tokens < 1 then
+                -- Calculate wait time until next token is available
+                local wait_seconds = math.ceil((1 - tokens) / refill_rate)
+                return {0, wait_seconds}  -- {rejected, wait_time_seconds}
             end
 
+            -- Consume one token
+            tokens = tokens - 1
+
+            -- Update bucket state
+            redis.call('HMSET', bucket_key, 'tokens', tokens, 'last_refill', last_refill)
+            redis.call('PEXPIRE', bucket_key, expiration_ms)
+
+            -- Concurrency check (same logic as before)
             if max_concurrent > 0 then
                 local concurrent = redis.call('GET', concurrency_key)
                 if concurrent and tonumber(concurrent) >= max_concurrent then
-                    local reverted = redis.call('DECR', bucket_key)
-                    if reverted <= 0 then
-                        redis.call('DEL', bucket_key)
-                    end
-                    return -1
+                    -- Rollback: refund the token we just consumed
+                    tokens = tokens + 1
+                    redis.call('HMSET', bucket_key, 'tokens', tokens, 'last_refill', last_refill)
+                    return {-1, 0}  -- {concurrency_limit, wait_time}
                 end
                 redis.call('INCR', concurrency_key)
-                redis.call('PEXPIRE', concurrency_key, window * 1000)
+                redis.call('PEXPIRE', concurrency_key, expiration_ms)
             end
 
-            return 1
+            return {1, 0}  -- {allowed, wait_time}
             """
         )
 
@@ -92,18 +130,36 @@ class RedisRateLimiter:
 
     # ------------------------------------------------------------------ API
     def acquire(self) -> "RateLimitToken":
-        """Attempt to reserve capacity; raise if the quota is exhausted."""
+        """Attempt to reserve capacity; raise if the quota is exhausted.
+        
+        Returns a RateLimitToken that must be released (or used as context manager).
+        """
         bucket_key = self._bucket_key()
         concurrency_key = self._concurrency_key()
+        current_time = int(time.time())  # Unix timestamp in seconds
+        expiration_ms = (self._window + 10) * 1000  # Add 10s buffer for expiration
 
         result = self._acquire_script(
             keys=[bucket_key, concurrency_key],
-            args=[self._limit, self._window, self._max_concurrent],
+            args=[
+                self._capacity,
+                self._refill_rate,
+                current_time,
+                self._max_concurrent,
+                expiration_ms,
+            ],
         )
 
-        if result == 0:
-            raise RateLimitExceeded("LLM rate limit exceeded (300 calls per minute).")
-        if result == -1:
+        # Result is a list: [status, wait_time]
+        status = result[0]
+        wait_time = result[1] if len(result) > 1 else 0
+
+        if status == 0:
+            error_msg = f"LLM rate limit exceeded ({self._limit} calls per {self._window}s)."
+            if wait_time > 0:
+                error_msg += f" Retry in {wait_time}s."
+            raise RateLimitExceeded(error_msg)
+        if status == -1:
             raise RateLimitExceeded("LLM concurrency limit reached.")
 
         return RateLimitToken(self, concurrency_key if self._max_concurrent > 0 else None)
