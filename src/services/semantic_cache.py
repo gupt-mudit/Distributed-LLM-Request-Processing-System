@@ -93,6 +93,27 @@ class SemanticCacheService:
             hit_count=payload.get("hit_count", 0),
         )
 
+    def get_response_text(self, cache_entry_id: str) -> Optional[str]:
+        """Get response text from a cache entry by ID.
+        
+        Args:
+            cache_entry_id: The Qdrant point ID.
+            
+        Returns:
+            Response text if found, None otherwise. Handles errors gracefully.
+        """
+        try:
+            cache_point = self._qdrant.get(cache_entry_id)
+            if cache_point:
+                return cache_point.get("payload", {}).get("response_text")
+            return None
+        except Exception as exc:
+            logger.warning(
+                f"Failed to retrieve cache entry {cache_entry_id}: {exc}",
+                exc_info=False,
+            )
+            return None
+
     def record_hit(self, cache_entry_id: str) -> None:
         """Record a cache hit (increment hit count)."""
         self._qdrant.update_hit_count(cache_entry_id)

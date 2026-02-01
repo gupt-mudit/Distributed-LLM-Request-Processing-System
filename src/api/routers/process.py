@@ -16,138 +16,186 @@ from src.api.dependencies import (
 )
 from src.api.schemas import ProcessRequest, ProcessResponse
 from src.models.mongodb_models import PromptPriority, PromptStatus
-from src.services.semantic_cache import CacheHit
+from src.services.semantic_cache import CacheHit, SemanticCacheService
 
 router = APIRouter(prefix="/process", tags=["processing"])
 
 logger = logging.getLogger(__name__)
 
 
-@router.post("", response_model=ProcessResponse)
-def process_prompt(
-    payload: ProcessRequest,
-    collection: Collection = Depends(get_db_collection),
-    embedding_service=Depends(get_embedding_service),
-    cache_service=Depends(get_cache_service),
-    task_client=Depends(get_prompt_task_client),
-) -> ProcessResponse:
-    start_time = time.perf_counter()
+# ============================================================================
+# Helper Functions
+# ============================================================================
 
-    # Find existing request (atomic operation)
-    existing = collection.find_one(
-        {"user_id": payload.user_id, "prompt_id": payload.prompt_id}
+def _build_response_from_existing(
+    existing: dict,
+    cache_service: SemanticCacheService,
+    start_time: float,
+) -> ProcessResponse:
+    """Build ProcessResponse from existing MongoDB document.
+    
+    Args:
+        existing: MongoDB document.
+        cache_service: Semantic cache service.
+        start_time: Start time for processing time calculation.
+        
+    Returns:
+        ProcessResponse object.
+    """
+    cache_entry_id = existing.get("cache_entry_id")
+    response_text = cache_service.get_response_text(cache_entry_id) if cache_entry_id else None
+    
+    return ProcessResponse(
+        user_id=existing["user_id"],
+        prompt_id=existing["prompt_id"],
+        status=existing.get("status", PromptStatus.QUEUED.value),
+        cached=existing.get("cached", False),
+        response=response_text,
+        processing_time_ms=existing.get("processing_time_ms"),
+        retry_count=existing.get("retry_count", 0),
+        error=existing.get("error_message"),
     )
 
-    # If completed and has cache entry, return cached response
-    if (
-        existing
-        and existing.get("status") == PromptStatus.COMPLETED.value
-        and existing.get("cache_entry_id")
-    ):
-        try:
-            cache_point = cache_service._qdrant.get(existing["cache_entry_id"])
-            if cache_point:
-                cache_service.record_hit(existing["cache_entry_id"])
-                return ProcessResponse(
-                    user_id=payload.user_id,
-                    prompt_id=payload.prompt_id,
-                    status=PromptStatus.COMPLETED.value,
-                    cached=True,
-                    response=cache_point["payload"].get("response_text", ""),
-                    processing_time_ms=int((time.perf_counter() - start_time) * 1000),
-                    retry_count=existing.get("retry_count", 0),
-                )
-        except Exception as exc:
-            logger.warning(
-                "Failed to retrieve cache entry, will continue processing",
-                extra={
-                    "user_id": payload.user_id,
-                    "prompt_id": payload.prompt_id,
-                    "error": str(exc),
-                },
-            )
-            # Continue to cache lookup below
 
-    # If queued or processing, return current status
-    if existing and existing.get("status") in {
-        PromptStatus.QUEUED.value,
-        PromptStatus.PROCESSING.value,
-    }:
-        response_text = None
-        if existing.get("cache_entry_id"):
-            try:
-                cache_point = cache_service._qdrant.get(existing["cache_entry_id"])
-                response_text = (
-                    cache_point["payload"].get("response_text") if cache_point else None
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to retrieve cache entry for queued/processing request",
-                    extra={
-                        "user_id": existing.get("user_id"),
-                        "prompt_id": existing.get("prompt_id"),
-                        "error": str(exc),
-                    },
-                )
-                response_text = None
-
-        return ProcessResponse(
-            user_id=existing["user_id"],
-            prompt_id=existing["prompt_id"],
-            status=existing["status"],
-            cached=existing.get("cached", False),
-            response=response_text,
-            processing_time_ms=existing.get("processing_time_ms"),
-            retry_count=existing.get("retry_count", 0),
-            error=existing.get("error_message"),
-        )
-
-    # If failed, return failed status
-    if existing and existing.get("status") == PromptStatus.FAILED.value:
-        return ProcessResponse(
-            user_id=existing["user_id"],
-            prompt_id=existing["prompt_id"],
-            status=PromptStatus.FAILED.value,
-            cached=False,
-            response=None,
-            processing_time_ms=existing.get("processing_time_ms"),
-            retry_count=existing.get("retry_count", 0),
-            error=existing.get("error_message"),
-        )
-
-    # Generate embedding and check cache
-    prompt_text = payload.text.strip()
-    embedding = embedding_service.embed(prompt_text)
-    cache_hit = cache_service.lookup(embedding)
-
-    if cache_hit:
-        cache_service.record_hit(cache_hit.cache_entry_id)
-        processing_time_ms = int((time.perf_counter() - start_time) * 1000)
-        _persist_prompt_request(
-            collection,
-            payload=payload,
-            status=PromptStatus.COMPLETED,
-            cache_entry_id=cache_hit.cache_entry_id,
-            cached=True,
-            processing_time_ms=processing_time_ms,
-            retry_count=existing.get("retry_count", 0) if existing else 0,
-        )
+def _handle_completed_with_cache(
+    existing: dict,
+    payload: ProcessRequest,
+    cache_service: SemanticCacheService,
+    start_time: float,
+) -> Optional[ProcessResponse]:
+    """Handle completed request with cache entry.
+    
+    Args:
+        existing: MongoDB document.
+        payload: Process request payload.
+        cache_service: Semantic cache service.
+        start_time: Start time for processing time calculation.
+        
+    Returns:
+        ProcessResponse if cache hit, None otherwise.
+    """
+    cache_entry_id = existing.get("cache_entry_id")
+    if not cache_entry_id:
+        return None
+    
+    response_text = cache_service.get_response_text(cache_entry_id)
+    if response_text:
+        cache_service.record_hit(cache_entry_id)
         return ProcessResponse(
             user_id=payload.user_id,
             prompt_id=payload.prompt_id,
             status=PromptStatus.COMPLETED.value,
             cached=True,
-            response=cache_hit.response_text,
-            processing_time_ms=processing_time_ms,
-            retry_count=existing.get("retry_count", 0) if existing else 0,
+            response=response_text,
+            processing_time_ms=int((time.perf_counter() - start_time) * 1000),
+            retry_count=existing.get("retry_count", 0),
         )
+    return None
 
-    # Cache miss - create request and enqueue task
+
+def _handle_existing_request(
+    existing: dict,
+    payload: ProcessRequest,
+    cache_service: SemanticCacheService,
+    start_time: float,
+) -> Optional[ProcessResponse]:
+    """Handle existing request based on status.
+    
+    Args:
+        existing: MongoDB document.
+        payload: Process request payload.
+        cache_service: Semantic cache service.
+        start_time: Start time for processing time calculation.
+        
+    Returns:
+        ProcessResponse if handled, None if should continue processing.
+    """
+    status = existing.get("status")
+    
+    # Completed with cache - try to return cached response
+    if status == PromptStatus.COMPLETED.value and existing.get("cache_entry_id"):
+        response = _handle_completed_with_cache(
+            existing, payload, cache_service, start_time
+        )
+        if response:
+            return response
+        # Cache retrieval failed, continue to semantic cache lookup
+    
+    # Queued or processing - return current status
+    if status in {PromptStatus.QUEUED.value, PromptStatus.PROCESSING.value}:
+        return _build_response_from_existing(existing, cache_service, start_time)
+    
+    # Failed - return failed status
+    if status == PromptStatus.FAILED.value:
+        return _build_response_from_existing(existing, cache_service, start_time)
+    
+    return None
+
+
+def _handle_cache_hit(
+    cache_hit: CacheHit,
+    payload: ProcessRequest,
+    collection: Collection,
+    cache_service: SemanticCacheService,
+    existing: Optional[dict],
+    start_time: float,
+) -> ProcessResponse:
+    """Handle semantic cache hit.
+    
+    Args:
+        cache_hit: Cache hit result.
+        payload: Process request payload.
+        collection: MongoDB collection.
+        cache_service: Semantic cache service.
+        existing: Existing MongoDB document (if any).
+        start_time: Start time for processing time calculation.
+        
+    Returns:
+        ProcessResponse with cached result.
+    """
+    cache_service.record_hit(cache_hit.cache_entry_id)
+    processing_time_ms = int((time.perf_counter() - start_time) * 1000)
+    
+    _persist_prompt_request(
+        collection=collection,
+        payload=payload,
+        status=PromptStatus.COMPLETED,
+        cache_entry_id=cache_hit.cache_entry_id,
+        cached=True,
+        processing_time_ms=processing_time_ms,
+        retry_count=existing.get("retry_count", 0) if existing else 0,
+    )
+    
+    return ProcessResponse(
+        user_id=payload.user_id,
+        prompt_id=payload.prompt_id,
+        status=PromptStatus.COMPLETED.value,
+        cached=True,
+        response=cache_hit.response_text,
+        processing_time_ms=processing_time_ms,
+        retry_count=existing.get("retry_count", 0) if existing else 0,
+    )
+
+
+def _enqueue_new_request(
+    payload: ProcessRequest,
+    collection: Collection,
+    task_client,
+    existing: Optional[dict],
+) -> None:
+    """Create request document and enqueue Celery task.
+    
+    Args:
+        payload: Process request payload.
+        collection: MongoDB collection.
+        task_client: Task client for enqueuing.
+        existing: Existing MongoDB document (if any).
+    """
     now = datetime.now(timezone.utc)
     request_doc = {
         "user_id": payload.user_id,
         "prompt_id": payload.prompt_id,
-        "prompt_text": prompt_text,
+        "prompt_text": payload.text.strip(),
         "status": PromptStatus.QUEUED.value,
         "priority": payload.priority,
         "cached": False,
@@ -158,23 +206,72 @@ def process_prompt(
         "created_at": existing.get("created_at", now) if existing else now,
         "updated_at": now,
     }
-
-    # Upsert (atomic operation)
+    
     collection.update_one(
         {"user_id": payload.user_id, "prompt_id": payload.prompt_id},
         {"$set": request_doc},
         upsert=True,
     )
-
-    # Enqueue task for background processing
+    
     task_client.enqueue(
         user_id=payload.user_id,
         prompt_id=payload.prompt_id,
-        text=prompt_text,
+        text=payload.text.strip(),
         priority=payload.priority,
     )
 
-    # Return immediately - client should poll GET /process/{user_id}/{prompt_id} for status
+
+# ============================================================================
+# API Endpoints
+# ============================================================================
+
+@router.post("", response_model=ProcessResponse)
+def process_prompt(
+    payload: ProcessRequest,
+    collection: Collection = Depends(get_db_collection),
+    embedding_service=Depends(get_embedding_service),
+    cache_service: SemanticCacheService = Depends(get_cache_service),
+    task_client=Depends(get_prompt_task_client),
+) -> ProcessResponse:
+    """Process a prompt request.
+    
+    Returns immediately with queued status if cache miss,
+    or completed status if cache hit.
+    """
+    start_time = time.perf_counter()
+    
+    # Find existing request
+    existing = collection.find_one(
+        {"user_id": payload.user_id, "prompt_id": payload.prompt_id}
+    )
+    
+    # Handle existing requests
+    if existing:
+        response = _handle_existing_request(
+            existing, payload, cache_service, start_time
+        )
+        if response:
+            return response
+    
+    # New request or cache miss - generate embedding and check cache
+    prompt_text = payload.text.strip()
+    embedding = embedding_service.embed(prompt_text)
+    cache_hit = cache_service.lookup(embedding)
+    
+    # Handle cache hit
+    if cache_hit:
+        return _handle_cache_hit(
+            cache_hit=cache_hit,
+            payload=payload,
+            collection=collection,
+            cache_service=cache_service,
+            existing=existing,
+            start_time=start_time,
+        )
+    
+    # Cache miss - enqueue for background processing
+    _enqueue_new_request(payload, collection, task_client, existing)
+    
     return ProcessResponse(
         user_id=payload.user_id,
         prompt_id=payload.prompt_id,
@@ -192,45 +289,23 @@ def get_prompt_status(
     user_id: str,
     prompt_id: str,
     collection: Collection = Depends(get_db_collection),
-    cache_service=Depends(get_cache_service),
+    cache_service: SemanticCacheService = Depends(get_cache_service),
 ) -> ProcessResponse:
+    """Get the status of a prompt request."""
     request = collection.find_one({"user_id": user_id, "prompt_id": prompt_id})
-
+    
     if request is None:
         raise HTTPException(
             status_code=404,
-            detail="PromptRequest not found.",
+            detail=f"PromptRequest not found: user_id={user_id}, prompt_id={prompt_id}",
         )
+    
+    return _build_response_from_existing(request, cache_service, 0.0)
 
-    response_text = None
-    if request.get("cache_entry_id"):
-        try:
-            cache_point = cache_service._qdrant.get(request["cache_entry_id"])
-            response_text = (
-                cache_point["payload"].get("response_text") if cache_point else None
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to retrieve cache entry",
-                extra={
-                    "user_id": user_id,
-                    "prompt_id": prompt_id,
-                    "error": str(exc),
-                },
-            )
-            response_text = None
 
-    return ProcessResponse(
-        user_id=request["user_id"],
-        prompt_id=request["prompt_id"],
-        status=request.get("status", PromptStatus.QUEUED.value),
-        cached=request.get("cached", False),
-        response=response_text,
-        processing_time_ms=request.get("processing_time_ms"),
-        retry_count=request.get("retry_count", 0),
-        error=request.get("error_message"),
-    )
-
+# ============================================================================
+# Database Operations
+# ============================================================================
 
 def _persist_prompt_request(
     collection: Collection,
@@ -253,7 +328,7 @@ def _persist_prompt_request(
         "prompt_text": payload.text,
         "updated_at": now,
     }
-
+    
     collection.update_one(
         {"user_id": payload.user_id, "prompt_id": payload.prompt_id},
         {"$set": update_doc},
