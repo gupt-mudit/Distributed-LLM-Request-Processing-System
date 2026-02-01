@@ -24,7 +24,6 @@ class StubRedisClient:
     def __init__(self):
         self.tokens = None  # None means uninitialized, will be set to capacity on first call
         self.last_refill = None
-        self.concurrency = 0
         self.acquire_registered = False
 
     def register_script(self, _script_body):
@@ -32,11 +31,10 @@ class StubRedisClient:
             self.acquire_registered = True
 
             def acquire(*, keys, args):
-                # Token bucket args: capacity, refill_rate, current_time, max_concurrent, expiration_ms
+                # Token bucket args: capacity, refill_rate, current_time, expiration_ms
                 capacity = float(args[0])
                 refill_rate = float(args[1])
                 current_time = int(args[2])
-                max_concurrent = int(args[3])
 
                 # Initialize bucket if needed
                 if self.tokens is None:
@@ -58,24 +56,11 @@ class StubRedisClient:
                 # Consume one token
                 self.tokens -= 1
 
-                # Concurrency check
-                if max_concurrent > 0:
-                    if self.concurrency >= max_concurrent:
-                        # Rollback: refund the token
-                        self.tokens += 1
-                        return [-1, 0]  # {concurrency_limit, wait_time}
-                    self.concurrency += 1
-
                 return [1, 0]  # {allowed, wait_time}
 
             return acquire
 
-        def release(*, keys):
-            if self.concurrency > 0:
-                self.concurrency -= 1
-            return 1
-
-        return release
+        return lambda *args, **kwargs: None  # No-op for release script
 
 
 @pytest.fixture()
@@ -87,41 +72,25 @@ def stub_redis():
 
 
 def test_rate_limiter_allows_within_limit(stub_redis) -> None:
-    limiter = RedisRateLimiter(limit_per_minute=3, window_seconds=60, max_concurrent=0)
+    limiter = RedisRateLimiter(limit_per_minute=3, window_seconds=60)
 
     for _ in range(3):
-        token = limiter.acquire()
-        token.release()
+        limiter.acquire()
 
     with pytest.raises(RateLimitExceeded):
         limiter.acquire()
-
-
-def test_rate_limiter_enforces_concurrency(stub_redis) -> None:
-    limiter = RedisRateLimiter(limit_per_minute=10, window_seconds=60, max_concurrent=2)
-
-    token1 = limiter.acquire()
-    token2 = limiter.acquire()
-
-    with pytest.raises(RateLimitExceeded):
-        limiter.acquire()
-
-    token1.release()
-    limiter.acquire().release()
-    token2.release()
 
 
 def test_rate_limiter_token_refill(stub_redis) -> None:
     """Test that tokens refill over time in token bucket implementation."""
     import time
     
-    limiter = RedisRateLimiter(limit_per_minute=60, window_seconds=60, max_concurrent=0)
+    limiter = RedisRateLimiter(limit_per_minute=60, window_seconds=60)
     # Refill rate = 60/60 = 1 token per second
     
     # Consume all tokens
     for _ in range(60):
-        token = limiter.acquire()
-        token.release()
+        limiter.acquire()
     
     # Should be rate limited now
     with pytest.raises(RateLimitExceeded):
@@ -134,10 +103,8 @@ def test_rate_limiter_token_refill(stub_redis) -> None:
     
     # The next acquire will use current_time, so elapsed = 2 seconds
     # This should refill 2 tokens (1 token/second * 2 seconds)
-    token1 = limiter.acquire()
-    token1.release()
-    token2 = limiter.acquire()
-    token2.release()
+    limiter.acquire()
+    limiter.acquire()
     
     # But not a third (only 2 tokens were refilled)
     with pytest.raises(RateLimitExceeded):
